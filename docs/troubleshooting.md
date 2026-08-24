@@ -1,20 +1,23 @@
 # Troubleshooting
 
-Work from the source toward OpenObserve. Do not debug the pipeline before confirming packets and raw ingestion.
+Work from the source toward OpenObserve. Do not debug the OpenObserve pipeline before confirming packets and raw ingestion.
 
 ## 1. Containers
 
 ```bash
-docker compose ps
+docker compose ps -a
 ```
 
-All three services should be running:
+Expected state:
 
 ```text
-openobserve
-syslog-ng
-goflow2
+openobserve        running
+goflow2            running
+syslog-ng          running
+goflow-pipe-init   exited (0)
 ```
+
+`goflow-pipe-init` is a one-shot initializer. `exited (0)` is correct; it creates the FIFO and exits.
 
 Inspect logs:
 
@@ -22,6 +25,7 @@ Inspect logs:
 docker compose logs --tail=200 openobserve
 docker compose logs --tail=200 syslog-ng
 docker compose logs --tail=200 goflow2
+docker compose logs --tail=50 goflow-pipe-init
 ```
 
 ## 2. OpenObserve health
@@ -59,9 +63,29 @@ UDP/2055 -> goflow2
 docker compose exec syslog-ng syslog-ng --syntax-only
 ```
 
-The repository uses syslog-ng's native `openobserve-log()` destination, which requires syslog-ng 4.5 or newer. The official `balabit/syslog-ng:latest` image currently includes the published modules.
+The stack defaults to syslog-ng 4.12.0 and uses its native `openobserve-log()` destination.
 
-## 5. DNS: verify packets reach the host
+## 5. Verify the GoFlow2 FIFO
+
+```bash
+docker compose exec syslog-ng sh -c 'ls -l /run/goflow2/flows.pipe && test -p /run/goflow2/flows.pipe'
+```
+
+A successful `test -p` confirms that the path is a named pipe.
+
+Do **not** use `cat`, `tail -f`, or another persistent reader on the FIFO while syslog-ng is running. Multiple FIFO readers compete for bytes, so a diagnostic reader can steal NetFlow records from syslog-ng.
+
+If the FIFO is missing or has become a regular file:
+
+```bash
+docker compose down
+docker compose run --rm goflow-pipe-init
+docker compose up -d
+```
+
+Then repeat the `test -p` check.
+
+## 6. DNS: verify packets reach the host
 
 ```bash
 sudo tcpdump -ni any udp port 5514
@@ -72,11 +96,11 @@ Generate a DNS request through the MikroTik resolver.
 If packets do not arrive:
 
 1. Check `/system logging action` on RouterOS.
-2. Check the collector IP and UDP/5514.
+2. Check `remote-port=<collector-ip>:5514`.
 3. Check routing/VLAN/firewall between router and collector.
 4. Verify the RouterOS logging rule uses the expected remote action.
 
-## 6. DNS: verify RouterOS actually logs the query
+## 7. DNS: verify RouterOS actually logs the query
 
 On RouterOS:
 
@@ -90,9 +114,15 @@ Expected compact message:
 query from 10.254.249.10: #8630451 static.cloudflareinsights.com. A
 ```
 
-If only verbose `dns,packet` entries appear, check the `dns,!packet` logging rule.
+The repository configuration deliberately uses:
 
-## 7. DNS arrives at syslog-ng but not OpenObserve
+```routeros
+topics=dns,!packet regex="^query from "
+```
+
+so verbose DNS packet tracing is not exported.
+
+## 8. DNS arrives at syslog-ng but not OpenObserve
 
 Check syslog-ng logs:
 
@@ -100,7 +130,7 @@ Check syslog-ng logs:
 docker compose logs -f syslog-ng
 ```
 
-The DNS path requires all of these to match:
+The defensive syslog-ng DNS filter expects:
 
 ```text
 PROGRAM = dns
@@ -108,7 +138,7 @@ LEVEL   = notice
 MESSAGE starts with "query from "
 ```
 
-Inspect the actual syslog message if your RouterOS release or logging action produces different metadata. Temporarily loosen `f_mikrotik_dns_query` in `config/syslog-ng/syslog-ng.conf` to isolate which field differs.
+Inspect the actual syslog metadata if your RouterOS release/action produces different values. Temporarily loosen `f_mikrotik_dns_query` in `config/syslog-ng/syslog-ng.conf` to isolate the mismatch.
 
 After changing the configuration:
 
@@ -116,7 +146,7 @@ After changing the configuration:
 docker compose restart syslog-ng
 ```
 
-## 8. DNS stream exists but parser fields are absent
+## 9. DNS stream exists but parser fields are absent
 
 The OpenObserve real-time pipeline affects new records only.
 
@@ -125,7 +155,7 @@ Verify:
 1. `dnslog` is selected as the pipeline source.
 2. `mikrotik_dns_parser` is attached after the source.
 3. The destination points back to `dnslog`.
-4. No bypass path connects the source directly to the destination.
+4. No bypass path connects source directly to destination.
 5. Generate a new DNS query after saving the pipeline.
 
 Test the VRL function with:
@@ -136,7 +166,7 @@ Test the VRL function with:
 }
 ```
 
-## 9. Filtering appears ineffective
+## 10. Filtering appears ineffective
 
 `dns_filter.vrl` only sets:
 
@@ -152,7 +182,7 @@ dns_filter_drop = false
 
 Also remove any parallel/bypass route that writes the original event directly to the destination.
 
-## 10. NetFlow: verify UDP packets
+## 11. NetFlow: verify UDP packets
 
 ```bash
 sudo tcpdump -ni any udp port 2055
@@ -165,45 +195,77 @@ On RouterOS:
 /ip traffic-flow target print detail
 ```
 
-Check that Traffic-Flow is enabled and the target points to the Docker host.
+Check that Traffic-Flow is enabled and the target points to the Docker host on UDP/2055.
 
-## 11. NetFlow packets arrive but no GoFlow2 records
+## 12. NetFlow packets arrive but `netflow` is empty
 
-Inspect GoFlow2:
+Work in this order:
 
-```bash
-docker compose logs -f goflow2
-```
-
-Inspect the shared file from the syslog-ng container:
+1. Confirm GoFlow2 is running:
 
 ```bash
-docker compose exec syslog-ng sh -c 'ls -l /var/log/goflow2 && tail -n 5 /var/log/goflow2/flows.log'
+docker compose ps goflow2
 ```
 
-Each line should be valid JSON.
+2. Check GoFlow2 errors:
 
-If the file does not exist, inspect GoFlow2 startup errors and volume permissions.
+```bash
+docker compose logs --tail=200 goflow2
+```
 
-## 12. GoFlow2 file has JSON but `netflow` is empty
+3. Confirm the FIFO exists:
 
-Check syslog-ng logs for JSON parser or OpenObserve authentication errors:
+```bash
+docker compose exec syslog-ng test -p /run/goflow2/flows.pipe
+```
+
+4. Check syslog-ng errors, especially JSON parsing and OpenObserve authentication:
 
 ```bash
 docker compose logs --tail=200 syslog-ng
 ```
 
-Then confirm the OpenObserve ingestion credentials in `.env`.
+5. Verify the `netflow` stream in OpenObserve with a recent time range.
 
-## 13. NetFlow misses expected LAN traffic
+Because the handoff is a FIFO, there is intentionally no `flows.log` file to inspect or rotate.
 
-This can be normal when the traffic is hardware-offloaded. MikroTik Traffic-Flow reports traffic processed by the router CPU; hardware-offloaded bridged traffic can be absent.
+## 13. GoFlow2 appears blocked during startup
+
+Opening a FIFO for writing can wait until a reader exists. This is normal for a short period while `syslog-ng` starts and opens the same FIFO.
+
+If it remains blocked:
+
+```bash
+docker compose ps -a
+docker compose logs syslog-ng goflow2
+```
+
+Verify that syslog-ng loaded `s_goflow2_pipe` successfully and that the named pipe exists.
+
+## 14. NetFlow misses expected LAN traffic
+
+This can be normal when traffic is hardware-offloaded. MikroTik Traffic-Flow reports traffic processed by the router CPU; hardware-offloaded bridged traffic can be absent.
 
 Also review the configured Traffic-Flow interface list and whether the observed packet path actually traverses those interfaces in software.
 
-## 14. OpenObserve disk usage grows quickly
+## 15. Field names differ from the example dashboards
 
-DNS query logging and unsampled flow export can create substantial event volume.
+NetFlow v9 is template-based. The exact GoFlow2 fields can vary with exporter templates and GoFlow2 version.
+
+Inspect a recent event:
+
+```sql
+SELECT *
+FROM "netflow"
+ORDER BY _timestamp DESC
+LIMIT 1;
+```
+
+Then adapt queries in `openobserve/sql/netflow_overview.sql` if your fields differ.
+
+## 16. OpenObserve disk usage grows quickly
+
+DNS query logging and unsampled flow export can create substantial event volume even though the GoFlow2/syslog-ng handoff itself does not store a flow file.
 
 Tune in this order:
 
@@ -211,9 +273,9 @@ Tune in this order:
 2. Set stream retention.
 3. Restrict Traffic-Flow to useful interfaces.
 4. Consider RouterOS packet sampling for high-volume links.
-5. Use pre-aggregated/summary streams for expensive long-range dashboards when needed.
+5. Use summary/pre-aggregated streams for expensive long-range dashboards when appropriate.
 
-## 15. Reset test data
+## 17. Reset test data
 
 If this is a disposable test deployment and you want a completely clean OpenObserve instance:
 
