@@ -1,0 +1,85 @@
+# OpenObserve / VRL function: netflow_geoip
+#
+# Uses OpenObserve's built-in MaxMind enrichment tables:
+#   maxmind_city
+#   maxmind_asn
+#
+# The Docker Compose configuration in this repository enables automatic MMDB
+# download/update and stores the databases under /data/mmdb.
+#
+# Source fields expected from GoFlow2:
+#   src_addr
+#   dst_addr
+
+src_addr = string(.src_addr) ?? ""
+dst_addr = string(.dst_addr) ?? ""
+
+# -----------------------------------------------------------------------------
+# Source IP - GeoIP City
+# -----------------------------------------------------------------------------
+if src_addr != "" && (is_ipv4(src_addr) || is_ipv6(src_addr)) {
+    src_city, src_city_err = get_enrichment_table_record(
+        "maxmind_city",
+        {"ip": src_addr}
+    )
+
+    if src_city_err == null {
+        .src_geo_country_code = string(src_city.country_code) ?? null
+        .src_geo_country_name = string(src_city.country_name) ?? null
+        .src_geo_city = string(src_city.city_name) ?? null
+        .src_geo_region = string(src_city.region_name) ?? null
+        .src_geo_timezone = string(src_city.timezone) ?? null
+
+        .src_geo_latitude = to_float(src_city.latitude) ?? null
+        .src_geo_longitude = to_float(src_city.longitude) ?? null
+    }
+
+    # -------------------------------------------------------------------------
+    # Source IP - ASN
+    # -------------------------------------------------------------------------
+    src_asn, src_asn_err = get_enrichment_table_record(
+        "maxmind_asn",
+        {"ip": src_addr}
+    )
+
+    if src_asn_err == null {
+        .src_geo_asn = to_int(src_asn.autonomous_system_number) ?? null
+        .src_geo_as_org = string(src_asn.autonomous_system_organization) ?? null
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Destination IP - GeoIP City
+# -----------------------------------------------------------------------------
+if dst_addr != "" && (is_ipv4(dst_addr) || is_ipv6(dst_addr)) {
+    dst_city, dst_city_err = get_enrichment_table_record(
+        "maxmind_city",
+        {"ip": dst_addr}
+    )
+
+    if dst_city_err == null {
+        .dst_geo_country_code = string(dst_city.country_code) ?? null
+        .dst_geo_country_name = string(dst_city.country_name) ?? null
+        .dst_geo_city = string(dst_city.city_name) ?? null
+        .dst_geo_region = string(dst_city.region_name) ?? null
+        .dst_geo_timezone = string(dst_city.timezone) ?? null
+
+        .dst_geo_latitude = to_float(dst_city.latitude) ?? null
+        .dst_geo_longitude = to_float(dst_city.longitude) ?? null
+    }
+
+    # -------------------------------------------------------------------------
+    # Destination IP - ASN
+    # -------------------------------------------------------------------------
+    dst_asn, dst_asn_err = get_enrichment_table_record(
+        "maxmind_asn",
+        {"ip": dst_addr}
+    )
+
+    if dst_asn_err == null {
+        .dst_geo_asn = to_int(dst_asn.autonomous_system_number) ?? null
+        .dst_geo_as_org = string(dst_asn.autonomous_system_organization) ?? null
+    }
+}
+
+.
