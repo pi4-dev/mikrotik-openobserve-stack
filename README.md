@@ -53,16 +53,18 @@ Traffic-Flow v9 ------+--> UDP/2055           |
 
 ## Components
 
-Default versions are pinned in `.env.example` so upgrades are explicit:
+Default image versions/tags are pinned in `.env.example` so upgrades are explicit:
 
 | Component | Default |
 |---|---|
 | OpenObserve | `v0.92.2` |
-| GoFlow2 | `v2.2.6` |
+| GoFlow2 | `v2` branch image `2d10ea3` |
 | syslog-ng | `4.12.0` |
 | Alpine init image | `3.23` |
 
-Override versions in `.env` when intentionally upgrading.
+GoFlow2's Docker registry does not publish release-number tags such as `v2.2.6`; this repository therefore pins a published multi-arch commit image from its maintained `v2` branch rather than using mutable `latest`.
+
+Override versions/tags in `.env` only when intentionally upgrading.
 
 ## Repository layout
 
@@ -84,6 +86,7 @@ Override versions in `.env` when intentionally upgrading.
 │       ├── dns_dga_score.sql
 │       └── netflow_overview.sql
 └── docs/
+    ├── collector.md
     ├── mikrotik.md
     ├── openobserve.md
     └── troubleshooting.md
@@ -268,6 +271,8 @@ packets
 
 Actual fields depend on the NetFlow v9 templates exported by RouterOS.
 
+For details of the GoFlow2/FIFO/syslog-ng handoff, batching and failure semantics see [docs/collector.md](docs/collector.md).
+
 ## Dashboard queries
 
 Starter SQL files:
@@ -343,6 +348,7 @@ Traffic-Flow sees traffic processed by the RouterOS CPU. Hardware-offloaded brid
 
 ## Documentation
 
+- [Collector: GoFlow2 + syslog-ng](docs/collector.md)
 - [MikroTik configuration](docs/mikrotik.md)
 - [OpenObserve functions, pipeline and streams](docs/openobserve.md)
 - [Troubleshooting runbook](docs/troubleshooting.md)
