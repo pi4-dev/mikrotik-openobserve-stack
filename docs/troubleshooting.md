@@ -44,8 +44,6 @@ If the UI starts but syslog-ng cannot ingest data, verify the credentials in `.e
 
 ## 3. Check listening UDP ports
 
-On the Docker host:
-
 ```bash
 ss -lunp | grep -E ':5514|:2055'
 ```
@@ -71,19 +69,15 @@ The stack defaults to syslog-ng 4.12.0 and uses its native `openobserve-log()` d
 docker compose exec syslog-ng sh -c 'ls -l /run/goflow2/flows.pipe && test -p /run/goflow2/flows.pipe'
 ```
 
-A successful `test -p` confirms that the path is a named pipe.
+Do **not** use `cat`, `tail -f`, or another persistent reader on the FIFO while syslog-ng is running. Multiple FIFO readers compete for bytes and a diagnostic reader can steal NetFlow records from syslog-ng.
 
-Do **not** use `cat`, `tail -f`, or another persistent reader on the FIFO while syslog-ng is running. Multiple FIFO readers compete for bytes, so a diagnostic reader can steal NetFlow records from syslog-ng.
-
-If the FIFO is missing or has become a regular file:
+If the FIFO is missing or is a regular file:
 
 ```bash
 docker compose down
 docker compose run --rm goflow-pipe-init
 docker compose up -d
 ```
-
-Then repeat the `test -p` check.
 
 ## 6. DNS: verify packets reach the host
 
@@ -100,9 +94,7 @@ If packets do not arrive:
 3. Check routing/VLAN/firewall between router and collector.
 4. Verify the RouterOS logging rule uses the expected remote action.
 
-## 7. DNS: verify RouterOS actually logs the query
-
-On RouterOS:
+## 7. DNS: verify RouterOS logs the query
 
 ```routeros
 /log print where topics~"dns"
@@ -114,7 +106,7 @@ Expected compact message:
 query from 10.254.249.10: #8630451 static.cloudflareinsights.com. A
 ```
 
-The repository configuration deliberately uses:
+The repository uses:
 
 ```routeros
 topics=dns,!packet regex="^query from "
@@ -124,13 +116,11 @@ so verbose DNS packet tracing is not exported.
 
 ## 8. DNS arrives at syslog-ng but not OpenObserve
 
-Check syslog-ng logs:
-
 ```bash
 docker compose logs -f syslog-ng
 ```
 
-The defensive syslog-ng DNS filter expects:
+The defensive syslog-ng filter expects:
 
 ```text
 PROGRAM = dns
@@ -138,27 +128,21 @@ LEVEL   = notice
 MESSAGE starts with "query from "
 ```
 
-Inspect the actual syslog metadata if your RouterOS release/action produces different values. Temporarily loosen `f_mikrotik_dns_query` in `config/syslog-ng/syslog-ng.conf` to isolate the mismatch.
-
-After changing the configuration:
-
-```bash
-docker compose restart syslog-ng
-```
+If RouterOS produces different metadata, temporarily loosen `f_mikrotik_dns_query` in `config/syslog-ng/syslog-ng.conf` and restart syslog-ng.
 
 ## 9. DNS stream exists but parser fields are absent
 
-The OpenObserve real-time pipeline affects new records only.
+The real-time pipeline affects new records only.
 
 Verify:
 
-1. `dnslog` is selected as the pipeline source.
-2. `mikrotik_dns_parser` is attached after the source.
-3. The destination points back to `dnslog`.
-4. No bypass path connects source directly to destination.
-5. Generate a new DNS query after saving the pipeline.
+1. `dnslog` is the pipeline source.
+2. `mikrotik_dns_parser` is attached.
+3. destination points back to `dnslog`.
+4. no bypass path connects source directly to destination.
+5. a new DNS query was generated after saving the pipeline.
 
-Test the VRL function with:
+Test input:
 
 ```json
 {
@@ -166,7 +150,7 @@ Test the VRL function with:
 }
 ```
 
-## 10. Filtering appears ineffective
+## 10. DNS filtering appears ineffective
 
 `dns_filter.vrl` only sets:
 
@@ -174,13 +158,13 @@ Test the VRL function with:
 dns_filter_drop=true
 ```
 
-The pipeline must contain a Condition after the function that passes only:
+The following Condition must pass only:
 
 ```text
 dns_filter_drop = false
 ```
 
-Also remove any parallel/bypass route that writes the original event directly to the destination.
+Also remove any parallel bypass route.
 
 ## 11. NetFlow: verify UDP packets
 
@@ -195,11 +179,9 @@ On RouterOS:
 /ip traffic-flow target print detail
 ```
 
-Check that Traffic-Flow is enabled and the target points to the Docker host on UDP/2055.
+Check that Traffic-Flow is enabled and points to the Docker host on UDP/2055.
 
 ## 12. NetFlow packets arrive but `netflow` is empty
-
-Work in this order:
 
 1. Confirm GoFlow2 is running:
 
@@ -207,31 +189,31 @@ Work in this order:
 docker compose ps goflow2
 ```
 
-2. Check GoFlow2 errors:
+2. Check GoFlow2 logs:
 
 ```bash
 docker compose logs --tail=200 goflow2
 ```
 
-3. Confirm the FIFO exists:
+3. Confirm FIFO:
 
 ```bash
 docker compose exec syslog-ng test -p /run/goflow2/flows.pipe
 ```
 
-4. Check syslog-ng errors, especially JSON parsing and OpenObserve authentication:
+4. Check syslog-ng JSON parsing/authentication errors:
 
 ```bash
 docker compose logs --tail=200 syslog-ng
 ```
 
-5. Verify the `netflow` stream in OpenObserve with a recent time range.
+5. Search a recent time range in OpenObserve.
 
-Because the handoff is a FIFO, there is intentionally no `flows.log` file to inspect or rotate.
+There is intentionally no `flows.log` file.
 
 ## 13. GoFlow2 appears blocked during startup
 
-Opening a FIFO for writing can wait until a reader exists. This is normal for a short period while `syslog-ng` starts and opens the same FIFO.
+Opening a FIFO writer can wait until a reader exists. A brief wait while syslog-ng starts is normal.
 
 If it remains blocked:
 
@@ -240,17 +222,121 @@ docker compose ps -a
 docker compose logs syslog-ng goflow2
 ```
 
-Verify that syslog-ng loaded `s_goflow2_pipe` successfully and that the named pipe exists.
+Verify syslog-ng loaded `s_goflow2_pipe` and the FIFO exists.
 
-## 14. NetFlow misses expected LAN traffic
+## 14. `direction` / `internet_flow` fields are absent
 
-This can be normal when traffic is hardware-offloaded. MikroTik Traffic-Flow reports traffic processed by the router CPU; hardware-offloaded bridged traffic can be absent.
+Verify the NetFlow OpenObserve pipeline contains:
 
-Also review the configured Traffic-Flow interface list and whether the observed packet path actually traverses those interfaces in software.
+```text
+netflow Source
+    ↓
+netflow_direction
+```
 
-## 15. Field names differ from the example dashboards
+and that you generated **new** flows after saving the pipeline.
 
-NetFlow v9 is template-based. The exact GoFlow2 fields can vary with exporter templates and GoFlow2 version.
+Test `netflow_direction` with:
+
+```json
+{
+  "src_addr": "10.0.0.10",
+  "dst_addr": "1.1.1.1"
+}
+```
+
+Expected:
+
+```json
+{
+  "internet_flow": true,
+  "direction": "outbound"
+}
+```
+
+If classification is wrong, edit `internal_nets` in `openobserve/functions/netflow_direction.vrl` to match your environment.
+
+## 15. MaxMind MMDB files are missing
+
+Verify `.env` contains:
+
+```dotenv
+ZO_MMDB_DISABLE_DOWNLOAD=false
+ZO_MMDB_DATA_DIR=/data/mmdb
+```
+
+Check the persistent directory:
+
+```bash
+find data/openobserve/mmdb -maxdepth 1 -type f -ls
+```
+
+Check inside OpenObserve:
+
+```bash
+docker compose exec openobserve sh -c 'ls -lah /data/mmdb'
+```
+
+Check logs:
+
+```bash
+docker compose logs openobserve | grep -Ei 'mmdb|maxmind|geolite'
+```
+
+If the directory stays empty, verify DNS and HTTPS egress to the MMDB and SHA256 URLs configured in `.env`.
+
+For manually managed/air-gapped mode see `docs/maxmind.md`.
+
+## 16. `netflow_geoip` compiles but adds no fields
+
+First test with a known public IP rather than RFC1918 addresses:
+
+```json
+{
+  "src_addr": "10.0.0.10",
+  "dst_addr": "1.1.1.1"
+}
+```
+
+The private source normally has no MaxMind result. The public destination should receive fields such as:
+
+```text
+dst_geo_country_code
+dst_geo_latitude
+dst_geo_longitude
+dst_geo_asn
+dst_geo_as_org
+```
+
+If public IPs also return no fields:
+
+1. verify MMDB files exist,
+2. verify `netflow_geoip` is after `netflow_direction`/Condition in the pipeline,
+3. generate new records after saving the pipeline,
+4. inspect OpenObserve logs.
+
+## 17. GeoIP works for one direction only
+
+Check the raw event actually contains both:
+
+```text
+src_addr
+dst_addr
+```
+
+Then test the function directly with explicit public values for each side.
+
+A failed lookup on one endpoint does not prevent enrichment of the other endpoint.
+
+## 18. NetFlow misses expected LAN traffic
+
+This can be normal for hardware-offloaded traffic. MikroTik Traffic-Flow reports traffic processed by the router CPU; hardware-offloaded bridged traffic can be absent.
+
+Also review the configured Traffic-Flow interface list.
+
+## 19. Field names differ from example dashboards
+
+NetFlow v9 is template-based. Exact GoFlow2 fields can vary.
 
 Inspect a recent event:
 
@@ -261,23 +347,24 @@ ORDER BY _timestamp DESC
 LIMIT 1;
 ```
 
-Then adapt queries in `openobserve/sql/netflow_overview.sql` if your fields differ.
+Adapt `openobserve/sql/netflow_overview.sql` if required.
 
-## 16. OpenObserve disk usage grows quickly
+## 20. OpenObserve disk usage grows quickly
 
-DNS query logging and unsampled flow export can create substantial event volume even though the GoFlow2/syslog-ng handoff itself does not store a flow file.
+DNS and unsampled flow export can create substantial volume.
 
 Tune in this order:
 
-1. Filter uninteresting DNS records in the pipeline.
-2. Set stream retention.
-3. Restrict Traffic-Flow to useful interfaces.
-4. Consider RouterOS packet sampling for high-volume links.
-5. Use summary/pre-aggregated streams for expensive long-range dashboards when appropriate.
+1. filter uninteresting DNS records,
+2. optionally keep only `internet_flow=true`,
+3. set stream retention,
+4. restrict Traffic-Flow interfaces,
+5. consider RouterOS packet sampling on high-volume links,
+6. use summary/pre-aggregated streams for expensive long-range dashboards.
 
-## 17. Reset test data
+## 21. Reset test data
 
-If this is a disposable test deployment and you want a completely clean OpenObserve instance:
+For a disposable test deployment only:
 
 ```bash
 docker compose down
@@ -285,4 +372,4 @@ rm -rf data/openobserve/*
 docker compose up -d
 ```
 
-This removes all OpenObserve local data, users, streams, functions, pipelines and dashboards. Do not use this procedure on a deployment containing data you need.
+This removes OpenObserve data, MMDB files, users, streams, functions, pipelines and dashboards. Do not use it on a deployment containing data you need.
