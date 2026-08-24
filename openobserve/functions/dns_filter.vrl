@@ -1,0 +1,47 @@
+# OpenObserve / VRL function: dns_filter
+#
+# This function does NOT drop an event by itself. It sets:
+#   .dns_filter_drop = true|false
+#
+# Add a Condition node after this function and pass only records where:
+#   dns_filter_drop = false
+#
+# A rule matches only when BOTH record_type and domain_suffix match.
+# record_type="*" means any DNS record type.
+
+rules = [
+    {
+        "record_type": "PTR",
+        "domain_suffix": "in-addr.arpa"
+    },
+    {
+        "record_type": "PTR",
+        "domain_suffix": "ip6.arpa"
+    }
+]
+
+record_type = upcase(string(.dns_record_type) ?? "")
+domain = downcase(string(.dns_domain) ?? "")
+
+drop_record = false
+
+for_each(rules) -> |_index, rule| {
+    rule_type = upcase(string!(rule.record_type))
+    rule_suffix = downcase(string!(rule.domain_suffix))
+
+    type_match = rule_type == "*" || record_type == rule_type
+
+    # Match the exact domain or a true child label. The explicit dot prevents
+    # "notgoogle.com" from matching a suffix rule for "google.com".
+    domain_match =
+        domain == rule_suffix ||
+        ends_with(domain, "." + rule_suffix)
+
+    if type_match && domain_match {
+        drop_record = true
+    }
+}
+
+.dns_filter_drop = drop_record
+
+.
