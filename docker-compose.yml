@@ -1,0 +1,59 @@
+services:
+  openobserve:
+    image: o2cr.ai/openobserve/openobserve:latest
+    container_name: openobserve
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Europe/Warsaw}
+      ZO_DATA_DIR: /data
+      ZO_ROOT_USER_EMAIL: ${OPENOBSERVE_USER}
+      ZO_ROOT_USER_PASSWORD: ${OPENOBSERVE_PASSWORD}
+    ports:
+      - "${OPENOBSERVE_PORT:-5080}:5080/tcp"
+    volumes:
+      - ./data/openobserve:/data
+    networks:
+      - observability
+
+  goflow2:
+    image: netsampler/goflow2:latest
+    container_name: goflow2
+    restart: unless-stopped
+    command:
+      - -listen
+      - netflow://:2055
+      - -transport.file
+      - /var/log/goflow2/flows.log
+    ports:
+      - "${NETFLOW_PORT:-2055}:2055/udp"
+    volumes:
+      - goflow-data:/var/log/goflow2
+    networks:
+      - observability
+
+  syslog-ng:
+    image: balabit/syslog-ng:latest
+    container_name: syslog-ng
+    restart: unless-stopped
+    depends_on:
+      - openobserve
+      - goflow2
+    environment:
+      TZ: ${TZ:-Europe/Warsaw}
+      OPENOBSERVE_USER: ${OPENOBSERVE_USER}
+      OPENOBSERVE_PASSWORD: ${OPENOBSERVE_PASSWORD}
+      OPENOBSERVE_ORG: ${OPENOBSERVE_ORG:-default}
+    ports:
+      - "${SYSLOG_PORT:-5514}:5514/udp"
+    volumes:
+      - ./config/syslog-ng/syslog-ng.conf:/etc/syslog-ng/syslog-ng.conf:ro
+      - goflow-data:/var/log/goflow2:ro
+    networks:
+      - observability
+
+volumes:
+  goflow-data:
+
+networks:
+  observability:
+    driver: bridge
