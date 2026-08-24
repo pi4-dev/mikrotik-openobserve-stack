@@ -8,6 +8,18 @@ services:
       ZO_DATA_DIR: /data
       ZO_ROOT_USER_EMAIL: ${OPENOBSERVE_USER}
       ZO_ROOT_USER_PASSWORD: ${OPENOBSERVE_PASSWORD}
+
+      # MaxMind GeoLite support used by openobserve/functions/netflow_geoip.vrl.
+      # OpenObserve disables automatic MMDB download by default, so this stack
+      # explicitly enables it and keeps the databases on the persistent /data
+      # bind mount.
+      ZO_MMDB_DISABLE_DOWNLOAD: ${ZO_MMDB_DISABLE_DOWNLOAD:-false}
+      ZO_MMDB_DATA_DIR: ${ZO_MMDB_DATA_DIR:-/data/mmdb}
+      ZO_MMDB_UPDATE_DURATION_DAYS: ${ZO_MMDB_UPDATE_DURATION_DAYS:-30}
+      ZO_MMDB_GEOLITE_CITYDB_URL: ${ZO_MMDB_GEOLITE_CITYDB_URL:-https://geoip.zinclabs.dev/GeoLite2-City.mmdb}
+      ZO_MMDB_GEOLITE_ASNDB_URL: ${ZO_MMDB_GEOLITE_ASNDB_URL:-https://geoip.zinclabs.dev/GeoLite2-ASN.mmdb}
+      ZO_MMDB_GEOLITE_CITYDB_SHA256_URL: ${ZO_MMDB_GEOLITE_CITYDB_SHA256_URL:-https://geoip.zinclabs.dev/GeoLite2-City.sha256}
+      ZO_MMDB_GEOLITE_ASNDB_SHA256_URL: ${ZO_MMDB_GEOLITE_ASNDB_SHA256_URL:-https://geoip.zinclabs.dev/GeoLite2-ASN.sha256}
     ports:
       - "${OPENOBSERVE_PORT:-5080}:5080/tcp"
     volumes:
