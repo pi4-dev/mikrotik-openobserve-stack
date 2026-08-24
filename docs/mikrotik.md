@@ -21,36 +21,31 @@ If LAN clients are expected to use the router resolver, `allow-remote-requests=y
 
 ## 2. Configure remote DNS logging
 
+Current RouterOS remote logging configuration uses `remote-port=IP:PORT` and `remote-log-format=syslog`.
+
 Create a dedicated remote action:
 
 ```routeros
-/system logging action
-add name=openobserve-dns \
-    target=remote \
-    remote=192.0.2.10 \
-    remote-port=5514 \
-    bsd-syslog=yes \
-    syslog-facility=local0 \
-    syslog-severity=notice
+/system logging action add name=openobserve-dns target=remote remote-port=192.0.2.10:5514 remote-log-format=syslog syslog-facility=local0 syslog-severity=notice
 ```
 
 Add the DNS logging rule:
 
 ```routeros
-/system logging
-add action=openobserve-dns topics=dns,!packet
+/system logging add action=openobserve-dns topics=dns,!packet regex="^query from "
 ```
 
-Why `dns,!packet`:
+The rule deliberately filters twice:
 
-- `dns` includes the useful compact line:
+- `topics=dns,!packet` includes DNS events while excluding verbose packet-level traces.
+- `regex="^query from "` makes RouterOS send only compact client query events to the collector.
+- syslog-ng applies the same message-prefix check again as a defensive filter.
+
+A useful event looks like:
 
 ```text
 query from 10.254.249.10: #8630451 static.cloudflareinsights.com. A
 ```
-
-- `!packet` suppresses verbose packet-level DNS trace messages.
-- syslog-ng performs one more filter and forwards only `MESSAGE` values beginning with `query from `.
 
 Verify:
 
@@ -65,22 +60,13 @@ Verify:
 Enable Traffic-Flow:
 
 ```routeros
-/ip traffic-flow
-set enabled=yes \
-    interfaces=all \
-    active-flow-timeout=1m \
-    inactive-flow-timeout=15s
+/ip traffic-flow set enabled=yes interfaces=all active-flow-timeout=1m inactive-flow-timeout=15s
 ```
 
 Add the collector target:
 
 ```routeros
-/ip traffic-flow target
-add dst-address=192.0.2.10 \
-    port=2055 \
-    version=9 \
-    v9-template-refresh=20 \
-    v9-template-timeout=1m
+/ip traffic-flow target add dst-address=192.0.2.10 port=2055 version=9 v9-template-refresh=20 v9-template-timeout=1m
 ```
 
 Verify:
@@ -123,13 +109,13 @@ For NetFlow records, GoFlow2 exposes the exporter/sampler address in `sampler_ad
 
 ## 8. Full example script
 
-A scriptable version is available in:
+A directly importable version is available in:
 
 ```text
 config/mikrotik/routeros.rsc
 ```
 
-Edit its `collectorIp` variable before running it.
+Replace both occurrences of `192.0.2.10` before importing it.
 
 ## References
 
