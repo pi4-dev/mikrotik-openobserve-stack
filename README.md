@@ -1,46 +1,68 @@
 # MikroTik → OpenObserve DNS + NetFlow stack
 
-A small Docker Compose stack for collecting two telemetry streams from MikroTik RouterOS:
+A reproducible Docker Compose stack for collecting two telemetry streams from MikroTik RouterOS:
 
 - **DNS queries**: RouterOS remote syslog → syslog-ng → OpenObserve stream `dnslog`
-- **NetFlow v9**: RouterOS Traffic-Flow → GoFlow2 → JSON file → syslog-ng → OpenObserve stream `netflow`
+- **NetFlow v9**: RouterOS Traffic-Flow → GoFlow2 → FIFO → syslog-ng → OpenObserve stream `netflow`
 
-The design intentionally keeps OpenObserve's deprecated built-in syslog listener out of the data path. syslog-ng receives RouterOS syslog and uses its native `openobserve-log()` destination. GoFlow2 receives NetFlow v9 on UDP/2055 and emits newline-delimited JSON which the same syslog-ng instance forwards to OpenObserve.
+The design intentionally keeps OpenObserve's deprecated built-in syslog listener out of the data path. syslog-ng receives RouterOS syslog and forwards structured records with its native `openobserve-log()` destination. GoFlow2 receives NetFlow v9 on UDP/2055 and emits newline-delimited JSON into a named pipe read by syslog-ng.
+
+A FIFO is used instead of an intermediate flow log file so there is no continuously growing `flows.log` to rotate or clean up.
 
 ## Architecture
 
 ```text
-                         +-----------------------+
-                         |       MikroTik        |
-                         |                       |
-DNS logging ------------+--> UDP/5514           |
-Traffic-Flow v9 ---------+--> UDP/2055           |
-                         +-----------+-----------+
-                                     |
-                 +-------------------+-------------------+
-                 |                                       |
-                 v                                       v
-        +----------------+                      +----------------+
-        |   syslog-ng    |                      |    GoFlow2     |
-        | UDP/5514       |                      | UDP/2055       |
-        +-------+--------+                      +-------+--------+
-                |                                       |
-                |                         JSON lines    |
-                |                              to shared volume
-                |                                       |
-                |                 +---------------------+
-                |                 |
-                v                 v
-             +------------------------+
-             |       syslog-ng        |
-             | OpenObserve JSON API   |
-             +-----------+------------+
-                         |
-              +----------+----------+
-              |                     |
-              v                     v
-      OpenObserve:dnslog     OpenObserve:netflow
+                      +-----------------------+
+                      |       MikroTik        |
+                      |                       |
+DNS logging ----------+--> UDP/5514           |
+Traffic-Flow v9 ------+--> UDP/2055           |
+                      +-----------+-----------+
+                                  |
+                 +----------------+----------------+
+                 |                                 |
+                 v                                 v
+        +----------------+                +----------------+
+        |   syslog-ng    |                |    GoFlow2     |
+        | UDP/5514       |                | UDP/2055       |
+        +-------+--------+                +-------+--------+
+                |                                 |
+                |                          JSON lines
+                |                                 |
+                |                                 v
+                |                         +---------------+
+                |                         | shared FIFO   |
+                |                         | flows.pipe    |
+                |                         +-------+-------+
+                |                                 |
+                +----------------+----------------+
+                                 |
+                                 v
+                      +-----------------------+
+                      |      syslog-ng        |
+                      | openobserve-log()     |
+                      +-----------+-----------+
+                                  |
+                         OpenObserve JSON API
+                                  |
+                      +-----------+-----------+
+                      |                       |
+                      v                       v
+              stream: dnslog          stream: netflow
 ```
+
+## Components
+
+Default versions are pinned in `.env.example` so upgrades are explicit:
+
+| Component | Default |
+|---|---|
+| OpenObserve | `v0.92.2` |
+| GoFlow2 | `v2.2.6` |
+| syslog-ng | `4.12.0` |
+| Alpine init image | `3.23` |
+
+Override versions in `.env` when intentionally upgrading.
 
 ## Repository layout
 
@@ -69,7 +91,7 @@ Traffic-Flow v9 ---------+--> UDP/2055           |
 
 ## Quick start
 
-### 1. Prepare the environment
+### 1. Clone and prepare
 
 ```bash
 git clone https://github.com/pi4-dev/mikrotik-openobserve-stack.git
@@ -81,14 +103,14 @@ mkdir -p data/openobserve
 Edit `.env` and set at least:
 
 ```dotenv
+OPENOBSERVE_ORG=default
 OPENOBSERVE_USER=root@example.com
 OPENOBSERVE_PASSWORD=change-me-now
-OPENOBSERVE_ORG=default
 ```
 
 `.env` is ignored by Git and must never be committed.
 
-For an existing OpenObserve installation, use dedicated ingestion credentials from the OpenObserve ingestion page instead of the root account when possible.
+For an existing OpenObserve deployment, use dedicated ingestion credentials from the OpenObserve ingestion page instead of the root account when possible.
 
 ### 2. Start the stack
 
@@ -97,10 +119,26 @@ docker compose pull
 docker compose up -d
 ```
 
-Check containers:
+Check status:
 
 ```bash
-docker compose ps
+docker compose ps -a
+```
+
+Expected state:
+
+```text
+openobserve        running
+goflow2            running
+syslog-ng          running
+goflow-pipe-init   exited (0)
+```
+
+`goflow-pipe-init` is intentionally a one-shot container. It creates `/run/goflow2/flows.pipe`, fixes its permissions and exits successfully.
+
+Useful logs:
+
+```bash
 docker compose logs -f openobserve
 docker compose logs -f syslog-ng
 docker compose logs -f goflow2
@@ -114,17 +152,25 @@ http://<collector-ip>:5080
 
 ### 3. Configure RouterOS
 
-Edit `config/mikrotik/routeros.rsc` and change the collector IP, or apply the commands manually as described in [docs/mikrotik.md](docs/mikrotik.md).
+Apply the commands from [docs/mikrotik.md](docs/mikrotik.md), or edit both occurrences of `192.0.2.10` in:
 
-The default ports used by this repository are:
+```text
+config/mikrotik/routeros.rsc
+```
+
+before importing it.
+
+Default ports:
 
 | Function | Protocol | Port |
 |---|---|---:|
-| RouterOS remote syslog | UDP | 5514 |
-| NetFlow v9 / IPFIX collector | UDP | 2055 |
+| RouterOS remote DNS syslog | UDP | 5514 |
+| NetFlow v9 collector | UDP | 2055 |
 | OpenObserve UI/API | TCP | 5080 |
 
-### 4. Create the DNS parser pipeline
+The RouterOS DNS logging rule uses both `topics=dns,!packet` and `regex="^query from "`, so only compact DNS query events are sent to syslog-ng.
+
+### 4. Create the OpenObserve DNS parser pipeline
 
 In OpenObserve create a real-time pipeline for stream `dnslog`:
 
@@ -146,7 +192,7 @@ Paste the function from:
 openobserve/functions/mikrotik_dns_parser.vrl
 ```
 
-The parser adds:
+It adds:
 
 ```text
 dns_client_ip
@@ -158,19 +204,21 @@ dns_public_suffix
 dns_registered_domain
 ```
 
-The optional `dns_filter.vrl` marks unwanted records with `dns_filter_drop=true`. A following Condition node can discard them.
+The optional `dns_filter.vrl` marks unwanted records with `dns_filter_drop=true`. A following Condition node must pass only `dns_filter_drop=false` if you want those events discarded.
 
-See [docs/openobserve.md](docs/openobserve.md) for the complete procedure.
+Do not leave a parallel source-to-destination path that bypasses the filter.
+
+See [docs/openobserve.md](docs/openobserve.md) for the full procedure.
 
 ## DNS event example
 
-RouterOS generates a compact DNS message such as:
+RouterOS generates:
 
 ```text
 query from 10.254.249.10: #8630451 static.cloudflareinsights.com. A
 ```
 
-After the OpenObserve parser:
+After the parser:
 
 ```json
 {
@@ -184,38 +232,58 @@ After the OpenObserve parser:
 }
 ```
 
-## NetFlow event example
+`dns_registered_domain` is Public-Suffix-List aware, so multi-label public suffixes such as `co.uk` are handled correctly.
 
-GoFlow2 receives RouterOS NetFlow v9 and produces JSON containing fields such as:
+## NetFlow processing
 
-```json
-{
-  "type": "NETFLOW_V9",
-  "sampler_address": "192.0.2.1",
-  "src_addr": "10.0.0.10",
-  "dst_addr": "1.1.1.1",
-  "src_port": 54321,
-  "dst_port": 443,
-  "proto": "TCP",
-  "bytes": 4271,
-  "packets": 17
-}
+RouterOS exports NetFlow v9 to:
+
+```text
+<collector-ip>:2055/udp
 ```
 
-These records are stored in the `netflow` stream.
+GoFlow2 decodes the flow templates and writes newline-delimited JSON to:
+
+```text
+/run/goflow2/flows.pipe
+```
+
+The pipe lives in the shared `goflow-pipe` Docker volume. syslog-ng reads it with a native `pipe()` source, parses each JSON line with `json-parser()` and sends the structured fields to OpenObserve stream `netflow`.
+
+No intermediate flow file is stored on disk by this handoff.
+
+Typical decoded fields include:
+
+```text
+type
+sampler_address
+src_addr
+dst_addr
+src_port
+dst_port
+proto
+bytes
+packets
+```
+
+Actual fields depend on the NetFlow v9 templates exported by RouterOS.
 
 ## Dashboard queries
 
-Two starter SQL files are included:
+Starter SQL files:
 
-- `openobserve/sql/dns_dga_score.sql` — client-level DGA heuristic with all component metrics and a 0–100 score.
-- `openobserve/sql/netflow_overview.sql` — starter NetFlow aggregations.
+- `openobserve/sql/dns_dga_score.sql` — explainable client-level DGA heuristic with raw metrics, normalized component scores and a final 0–100 score.
+- `openobserve/sql/netflow_overview.sql` — traffic volume, top sources/destinations, ports, protocols and exporter health.
 
-The DGA score is a heuristic/ranking signal, not a malware verdict. It combines domain singleton ratio, queries per domain, digit ratio, average registered-domain length and TLD diversity.
+The DGA score is a heuristic/ranking signal, not a malware verdict. It combines:
 
-## Important RouterOS limitation
+- singleton-domain percentage — 35%
+- low queries-per-domain ratio — 25%
+- digit percentage in registered domains — 15%
+- average registered-domain length — 15%
+- TLD diversity — 10%
 
-RouterOS Traffic-Flow sees traffic processed by the router CPU. Hardware-offloaded bridged traffic does not necessarily appear in Traffic-Flow. Design dashboards with that limitation in mind.
+The SQL file also contains suggested table-coloring thresholds.
 
 ## Validation
 
@@ -237,33 +305,52 @@ Expected:
 docker compose exec syslog-ng syslog-ng --syntax-only
 ```
 
+### FIFO
+
+```bash
+docker compose exec syslog-ng sh -c 'ls -l /run/goflow2/flows.pipe && test -p /run/goflow2/flows.pipe'
+```
+
+Do **not** run `cat`, `tail -f`, or another long-lived reader against the FIFO while syslog-ng is consuming it. A FIFO distributes bytes among readers; a diagnostic reader could steal flow records from syslog-ng.
+
 ### UDP listeners
 
 ```bash
 ss -lunp | grep -E ':5514|:2055'
 ```
 
-### GoFlow2 input
-
-After enabling Traffic-Flow on RouterOS:
+### Packet-level verification
 
 ```bash
-docker compose logs -f goflow2
+sudo tcpdump -ni any udp port 5514
+sudo tcpdump -ni any udp port 2055
 ```
 
-and verify that the `netflow` stream receives records in OpenObserve.
+See [docs/troubleshooting.md](docs/troubleshooting.md) for a full source-to-destination runbook.
+
+## Important RouterOS Traffic-Flow limitation
+
+Traffic-Flow sees traffic processed by the RouterOS CPU. Hardware-offloaded bridged traffic may bypass the CPU and therefore may not appear in the exported flow stream.
 
 ## Security notes
 
 - Keep `.env` out of Git.
-- Restrict UDP/5514 and UDP/2055 at the collector firewall to RouterOS exporter addresses.
+- Restrict UDP/5514 and UDP/2055 at the collector firewall to known RouterOS exporter addresses.
 - Do not expose OpenObserve TCP/5080 directly to the Internet.
 - Prefer dedicated OpenObserve ingestion credentials over the root account.
-- If OpenObserve is accessed across an untrusted network, put HTTPS in front of it or use a trusted internal TLS path.
+- Put HTTPS in front of OpenObserve when crossing an untrusted network.
+- Review retention early: DNS queries and unsampled flow telemetry can generate substantial data volume.
 
-## References
+## Documentation
 
-- OpenObserve self-hosted Docker and JSON ingestion documentation
-- syslog-ng `openobserve-log()` destination documentation
-- GoFlow2 project documentation
-- MikroTik RouterOS Logging and Traffic-Flow documentation
+- [MikroTik configuration](docs/mikrotik.md)
+- [OpenObserve functions, pipeline and streams](docs/openobserve.md)
+- [Troubleshooting runbook](docs/troubleshooting.md)
+
+## Upstream references
+
+- OpenObserve: https://openobserve.ai/docs/
+- syslog-ng OpenObserve destination: https://syslog-ng.github.io/admin-guide/070_Destinations/153_OpenObserve/README.html
+- GoFlow2: https://github.com/netsampler/goflow2
+- MikroTik RouterOS Logging: https://help.mikrotik.com/docs/spaces/ROS/pages/328094/Log
+- MikroTik RouterOS Traffic-Flow: https://help.mikrotik.com/docs/spaces/ROS/pages/21102653/Traffic%2BFlow
