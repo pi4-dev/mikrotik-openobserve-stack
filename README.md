@@ -1,39 +1,30 @@
 # MikroTik → OpenObserve DNS + NetFlow stack
 
-A reproducible Docker Compose stack for collecting two telemetry streams from MikroTik RouterOS:
+A reproducible Docker Compose stack for collecting and enriching telemetry from MikroTik RouterOS:
 
-- **DNS queries**: RouterOS remote syslog → syslog-ng → OpenObserve stream `dnslog`
-- **NetFlow v9**: RouterOS Traffic-Flow → GoFlow2 → FIFO → syslog-ng → OpenObserve stream `netflow`
+- **DNS queries**: RouterOS remote syslog → syslog-ng → OpenObserve `dnslog`
+- **NetFlow v9**: RouterOS Traffic-Flow → GoFlow2 → FIFO → syslog-ng → OpenObserve `netflow`
+- **NetFlow enrichment**: direction classification + MaxMind City/ASN
 
-The design intentionally keeps OpenObserve's deprecated built-in syslog listener out of the data path. syslog-ng receives RouterOS syslog and forwards structured records with its native `openobserve-log()` destination. GoFlow2 receives NetFlow v9 on UDP/2055 and emits newline-delimited JSON into a named pipe read by syslog-ng.
-
-A FIFO is used instead of an intermediate flow log file so there is no continuously growing `flows.log` to rotate or clean up.
+The design intentionally keeps OpenObserve's deprecated built-in syslog listener out of the data path. syslog-ng is the common HTTP/JSON ingestion client for OpenObserve.
 
 ## Architecture
 
 ```text
                       +-----------------------+
                       |       MikroTik        |
-                      |                       |
-DNS logging ----------+--> UDP/5514           |
-Traffic-Flow v9 ------+--> UDP/2055           |
                       +-----------+-----------+
                                   |
                  +----------------+----------------+
                  |                                 |
+       DNS syslog UDP/5514              NetFlow v9 UDP/2055
+                 |                                 |
                  v                                 v
         +----------------+                +----------------+
         |   syslog-ng    |                |    GoFlow2     |
-        | UDP/5514       |                | UDP/2055       |
         +-------+--------+                +-------+--------+
                 |                                 |
-                |                          JSON lines
-                |                                 |
-                |                                 v
-                |                         +---------------+
-                |                         | shared FIFO   |
-                |                         | flows.pipe    |
-                |                         +-------+-------+
+                |                          JSON to FIFO
                 |                                 |
                 +----------------+----------------+
                                  |
@@ -43,17 +34,22 @@ Traffic-Flow v9 ------+--> UDP/2055           |
                       | openobserve-log()     |
                       +-----------+-----------+
                                   |
-                         OpenObserve JSON API
-                                  |
-                      +-----------+-----------+
-                      |                       |
-                      v                       v
-              stream: dnslog          stream: netflow
+                     +------------+------------+
+                     |                         |
+                     v                         v
+               stream: dnslog           stream: netflow
+                     |                         |
+                     v                         v
+            mikrotik_dns_parser       netflow_direction
+                     |                         |
+                 dns_filter              netflow_geoip
 ```
+
+GoFlow2 uses a FIFO instead of an intermediate `flows.log`, so there is no unbounded transient flow file to rotate.
 
 ## Components
 
-Default image versions/tags are pinned in `.env.example` so upgrades are explicit:
+Default image versions/tags are pinned in `.env.example`:
 
 | Component | Default |
 |---|---|
@@ -61,10 +57,6 @@ Default image versions/tags are pinned in `.env.example` so upgrades are explici
 | GoFlow2 | `v2` branch image `2d10ea3` |
 | syslog-ng | `4.12.0` |
 | Alpine init image | `3.23` |
-
-GoFlow2's Docker registry does not publish release-number tags such as `v2.2.6`; this repository therefore pins a published multi-arch commit image from its maintained `v2` branch rather than using mutable `latest`.
-
-Override versions/tags in `.env` only when intentionally upgrading.
 
 ## Repository layout
 
@@ -81,20 +73,21 @@ Override versions/tags in `.env` only when intentionally upgrading.
 ├── openobserve/
 │   ├── functions/
 │   │   ├── mikrotik_dns_parser.vrl
-│   │   └── dns_filter.vrl
+│   │   ├── dns_filter.vrl
+│   │   ├── netflow_direction.vrl
+│   │   └── netflow_geoip.vrl
 │   └── sql/
 │       ├── dns_dga_score.sql
 │       └── netflow_overview.sql
 └── docs/
     ├── collector.md
+    ├── maxmind.md
     ├── mikrotik.md
     ├── openobserve.md
     └── troubleshooting.md
 ```
 
 ## Quick start
-
-### 1. Clone and prepare
 
 ```bash
 git clone https://github.com/pi4-dev/mikrotik-openobserve-stack.git
@@ -103,7 +96,7 @@ cp .env.example .env
 mkdir -p data/openobserve
 ```
 
-Edit `.env` and set at least:
+Edit `.env`:
 
 ```dotenv
 OPENOBSERVE_ORG=default
@@ -111,20 +104,11 @@ OPENOBSERVE_USER=root@example.com
 OPENOBSERVE_PASSWORD=change-me-now
 ```
 
-`.env` is ignored by Git and must never be committed.
-
-For an existing OpenObserve deployment, use dedicated ingestion credentials from the OpenObserve ingestion page instead of the root account when possible.
-
-### 2. Start the stack
+Then:
 
 ```bash
 docker compose pull
 docker compose up -d
-```
-
-Check status:
-
-```bash
 docker compose ps -a
 ```
 
@@ -137,15 +121,7 @@ syslog-ng          running
 goflow-pipe-init   exited (0)
 ```
 
-`goflow-pipe-init` is intentionally a one-shot container. It creates `/run/goflow2/flows.pipe`, fixes its permissions and exits successfully.
-
-Useful logs:
-
-```bash
-docker compose logs -f openobserve
-docker compose logs -f syslog-ng
-docker compose logs -f goflow2
-```
+`goflow-pipe-init` is intentionally a one-shot service that creates the GoFlow2/syslog-ng FIFO.
 
 OpenObserve UI:
 
@@ -153,29 +129,39 @@ OpenObserve UI:
 http://<collector-ip>:5080
 ```
 
-### 3. Configure RouterOS
+## MikroTik configuration
 
-Apply the commands from [docs/mikrotik.md](docs/mikrotik.md), or edit both occurrences of `192.0.2.10` in:
+Apply [docs/mikrotik.md](docs/mikrotik.md), or edit both occurrences of `192.0.2.10` in:
 
 ```text
 config/mikrotik/routeros.rsc
 ```
 
-before importing it.
-
 Default ports:
 
 | Function | Protocol | Port |
 |---|---|---:|
-| RouterOS remote DNS syslog | UDP | 5514 |
-| NetFlow v9 collector | UDP | 2055 |
+| RouterOS DNS syslog | UDP | 5514 |
+| NetFlow v9 | UDP | 2055 |
 | OpenObserve UI/API | TCP | 5080 |
 
-The RouterOS DNS logging rule uses both `topics=dns,!packet` and `regex="^query from "`, so only compact DNS query events are sent to syslog-ng.
+The RouterOS DNS logging rule filters to compact query records using:
 
-### 4. Create the OpenObserve DNS parser pipeline
+```text
+topics=dns,!packet
+regex="^query from "
+```
 
-In OpenObserve create a real-time pipeline for stream `dnslog`:
+## DNS pipeline
+
+Create these OpenObserve functions from the repository:
+
+```text
+mikrotik_dns_parser
+dns_filter          # optional
+```
+
+Recommended pipeline:
 
 ```text
 dnslog Source
@@ -189,13 +175,7 @@ mikrotik_dns_parser
 dnslog Destination
 ```
 
-Paste the function from:
-
-```text
-openobserve/functions/mikrotik_dns_parser.vrl
-```
-
-It adds:
+The parser adds:
 
 ```text
 dns_client_ip
@@ -207,21 +187,13 @@ dns_public_suffix
 dns_registered_domain
 ```
 
-The optional `dns_filter.vrl` marks unwanted records with `dns_filter_drop=true`. A following Condition node must pass only `dns_filter_drop=false` if you want those events discarded.
-
-Do not leave a parallel source-to-destination path that bypasses the filter.
-
-See [docs/openobserve.md](docs/openobserve.md) for the full procedure.
-
-## DNS event example
-
-RouterOS generates:
+Example input:
 
 ```text
 query from 10.254.249.10: #8630451 static.cloudflareinsights.com. A
 ```
 
-After the parser:
+Example parsed fields:
 
 ```json
 {
@@ -235,127 +207,237 @@ After the parser:
 }
 ```
 
-`dns_registered_domain` is Public-Suffix-List aware, so multi-label public suffixes such as `co.uk` are handled correctly.
+## NetFlow direction classification
 
-## NetFlow processing
-
-RouterOS exports NetFlow v9 to:
+Create:
 
 ```text
-<collector-ip>:2055/udp
+openobserve/functions/netflow_direction.vrl
 ```
 
-GoFlow2 decodes the flow templates and writes newline-delimited JSON to:
+The default internal prefixes are:
 
 ```text
-/run/goflow2/flows.pipe
+10.0.0.0/8
+192.168.0.0/16
 ```
 
-The pipe lives in the shared `goflow-pipe` Docker volume. syslog-ng reads it with a native `pipe()` source, parses each JSON line with `json-parser()` and sends the structured fields to OpenObserve stream `netflow`.
+Customize the `internal_nets` array when required.
 
-No intermediate flow file is stored on disk by this handoff.
-
-Typical decoded fields include:
+The function adds:
 
 ```text
-type
-sampler_address
-src_addr
-dst_addr
-src_port
-dst_port
-proto
-bytes
-packets
+internet_flow
+direction
 ```
 
-Actual fields depend on the NetFlow v9 templates exported by RouterOS.
+Classification:
 
-For details of the GoFlow2/FIFO/syslog-ng handoff, batching and failure semantics see [docs/collector.md](docs/collector.md).
+| Source | Destination | direction | internet_flow |
+|---|---|---|---|
+| internal | external | `outbound` | `true` |
+| external | internal | `inbound` | `true` |
+| internal | internal | `internal` | `false` |
+| external | external | `external` | `false` |
+
+## MaxMind GeoIP / ASN
+
+The stack enables OpenObserve's built-in MaxMind support. OpenObserve maintains two built-in enrichment tables:
+
+```text
+maxmind_city
+maxmind_asn
+```
+
+The Compose service enables MMDB download and persists the databases under the existing OpenObserve data mount:
+
+```dotenv
+ZO_MMDB_DISABLE_DOWNLOAD=false
+ZO_MMDB_DATA_DIR=/data/mmdb
+ZO_MMDB_UPDATE_DURATION_DAYS=30
+```
+
+On the Docker host this corresponds to:
+
+```text
+./data/openobserve/mmdb
+```
+
+Database and SHA256 URLs are configurable in `.env.example`.
+
+See [docs/maxmind.md](docs/maxmind.md) for automatic updates, verification and manual/air-gapped operation.
+
+## NetFlow GeoIP function
+
+Create:
+
+```text
+openobserve/functions/netflow_geoip.vrl
+```
+
+It enriches both endpoints using `maxmind_city` and `maxmind_asn`.
+
+Source fields:
+
+```text
+src_geo_country_code
+src_geo_country_name
+src_geo_city
+src_geo_region
+src_geo_timezone
+src_geo_latitude
+src_geo_longitude
+src_geo_asn
+src_geo_as_org
+```
+
+Destination fields:
+
+```text
+dst_geo_country_code
+dst_geo_country_name
+dst_geo_city
+dst_geo_region
+dst_geo_timezone
+dst_geo_latitude
+dst_geo_longitude
+dst_geo_asn
+dst_geo_as_org
+```
+
+Private addresses normally have no MaxMind record; failed lookups are treated as a normal condition and do not fail the event.
+
+## Recommended NetFlow pipeline
+
+Keep all flow classes:
+
+```text
+netflow Source
+    ↓
+netflow_direction
+    ↓
+netflow_geoip
+    ↓
+netflow Destination
+```
+
+Or store only Internet flows:
+
+```text
+netflow Source
+    ↓
+netflow_direction
+    ↓
+Condition: internet_flow = true
+    ↓
+netflow_geoip
+    ↓
+netflow Destination
+```
+
+The second form performs MaxMind lookup only for flows that will be retained.
+
+Do not leave a parallel Source → Destination bypass path in either pipeline.
+
+## Validate MaxMind
+
+Host filesystem:
+
+```bash
+find data/openobserve/mmdb -maxdepth 1 -type f -ls
+```
+
+Container:
+
+```bash
+docker compose exec openobserve sh -c 'ls -lah /data/mmdb'
+```
+
+OpenObserve log:
+
+```bash
+docker compose logs openobserve | grep -Ei 'mmdb|maxmind|geolite'
+```
+
+Test `netflow_geoip` with:
+
+```json
+{
+  "src_addr": "10.0.0.10",
+  "dst_addr": "1.1.1.1"
+}
+```
+
+The destination should receive public GeoIP/ASN fields when the MMDB databases are loaded.
 
 ## Dashboard queries
 
-Starter SQL files:
+Starter SQL:
 
-- `openobserve/sql/dns_dga_score.sql` — explainable client-level DGA heuristic with raw metrics, normalized component scores and a final 0–100 score.
-- `openobserve/sql/netflow_overview.sql` — traffic volume, top sources/destinations, ports, protocols and exporter health.
+- `openobserve/sql/dns_dga_score.sql` — explainable DGA heuristic, raw component metrics and final score 0–100.
+- `openobserve/sql/netflow_overview.sql` — flow/byte volume, top endpoints, ports, protocols and exporter health.
 
-The DGA score is a heuristic/ranking signal, not a malware verdict. It combines:
+The DNS DGA score combines:
 
 - singleton-domain percentage — 35%
 - low queries-per-domain ratio — 25%
-- digit percentage in registered domains — 15%
+- digit percentage — 15%
 - average registered-domain length — 15%
 - TLD diversity — 10%
 
-The SQL file also contains suggested table-coloring thresholds.
-
 ## Validation
 
-### OpenObserve
+OpenObserve health:
 
 ```bash
 curl -f http://127.0.0.1:5080/healthz
 ```
 
-Expected:
-
-```json
-{"status":"ok"}
-```
-
-### syslog-ng configuration
+syslog-ng syntax:
 
 ```bash
 docker compose exec syslog-ng syslog-ng --syntax-only
 ```
 
-### FIFO
+FIFO:
 
 ```bash
-docker compose exec syslog-ng sh -c 'ls -l /run/goflow2/flows.pipe && test -p /run/goflow2/flows.pipe'
+docker compose exec syslog-ng sh -c 'test -p /run/goflow2/flows.pipe && ls -l /run/goflow2/flows.pipe'
 ```
 
-Do **not** run `cat`, `tail -f`, or another long-lived reader against the FIFO while syslog-ng is consuming it. A FIFO distributes bytes among readers; a diagnostic reader could steal flow records from syslog-ng.
-
-### UDP listeners
+UDP listeners:
 
 ```bash
 ss -lunp | grep -E ':5514|:2055'
 ```
 
-### Packet-level verification
-
-```bash
-sudo tcpdump -ni any udp port 5514
-sudo tcpdump -ni any udp port 2055
-```
-
-See [docs/troubleshooting.md](docs/troubleshooting.md) for a full source-to-destination runbook.
+Do not attach another long-lived reader (`cat`, `tail -f`) to the FIFO while syslog-ng is consuming it; FIFO readers compete for records.
 
 ## Important RouterOS Traffic-Flow limitation
 
-Traffic-Flow sees traffic processed by the RouterOS CPU. Hardware-offloaded bridged traffic may bypass the CPU and therefore may not appear in the exported flow stream.
+Traffic-Flow sees traffic processed by the RouterOS CPU. Hardware-offloaded bridged traffic may bypass the CPU and therefore may not appear in NetFlow.
 
 ## Security notes
 
 - Keep `.env` out of Git.
-- Restrict UDP/5514 and UDP/2055 at the collector firewall to known RouterOS exporter addresses.
+- Restrict UDP/5514 and UDP/2055 to known RouterOS exporters.
 - Do not expose OpenObserve TCP/5080 directly to the Internet.
-- Prefer dedicated OpenObserve ingestion credentials over the root account.
-- Put HTTPS in front of OpenObserve when crossing an untrusted network.
-- Review retention early: DNS queries and unsampled flow telemetry can generate substantial data volume.
+- Prefer dedicated ingestion credentials over the root account.
+- Review retention early: DNS and unsampled flow telemetry can generate substantial volume.
 
 ## Documentation
 
 - [Collector: GoFlow2 + syslog-ng](docs/collector.md)
+- [MaxMind GeoIP/ASN](docs/maxmind.md)
 - [MikroTik configuration](docs/mikrotik.md)
-- [OpenObserve functions, pipeline and streams](docs/openobserve.md)
-- [Troubleshooting runbook](docs/troubleshooting.md)
+- [OpenObserve functions and pipelines](docs/openobserve.md)
+- [Troubleshooting](docs/troubleshooting.md)
 
 ## Upstream references
 
 - OpenObserve: https://openobserve.ai/docs/
+- OpenObserve MaxMind examples: https://openobserve.ai/docs/user-guide/data-processing/enrichment-tables/enrichment-example/
+- OpenObserve environment variables: https://openobserve.ai/docs/administration/configuration/environment-variables/
 - syslog-ng OpenObserve destination: https://syslog-ng.github.io/admin-guide/070_Destinations/153_OpenObserve/README.html
 - GoFlow2: https://github.com/netsampler/goflow2
 - MikroTik RouterOS Logging: https://help.mikrotik.com/docs/spaces/ROS/pages/328094/Log
