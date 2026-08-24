@@ -37,7 +37,9 @@ services:
       - goflow-pipe:/run/goflow2
 
   goflow2:
-    image: netsampler/goflow2:${GOFLOW2_VERSION:-v2.2.6}
+    # GoFlow2 Docker Hub does not publish release-number tags such as v2.2.6.
+    # 2d10ea3 is a published multi-arch immutable commit tag from the v2 branch.
+    image: netsampler/goflow2:${GOFLOW2_TAG:-2d10ea3}
     container_name: goflow2
     restart: unless-stopped
     depends_on:
