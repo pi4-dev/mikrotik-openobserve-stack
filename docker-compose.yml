@@ -1,6 +1,6 @@
 services:
   openobserve:
-    image: o2cr.ai/openobserve/openobserve:latest
+    image: openobserve/openobserve:${OPENOBSERVE_VERSION:-v0.92.2}
     container_name: openobserve
     restart: unless-stopped
     environment:
@@ -15,29 +15,55 @@ services:
     networks:
       - observability
 
+  # One-shot initializer for the GoFlow2 -> syslog-ng FIFO.
+  # It is expected to finish with exit code 0 after creating the named pipe.
+  goflow-pipe-init:
+    image: alpine:${ALPINE_VERSION:-3.23}
+    container_name: goflow-pipe-init
+    restart: "no"
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        pipe=/run/goflow2/flows.pipe
+        if [ -e "$pipe" ] && [ ! -p "$pipe" ]; then
+          rm -f "$pipe"
+        fi
+        if [ ! -p "$pipe" ]; then
+          mkfifo "$pipe"
+        fi
+        chmod 0666 "$pipe"
+    volumes:
+      - goflow-pipe:/run/goflow2
+
   goflow2:
-    image: netsampler/goflow2:latest
+    image: netsampler/goflow2:${GOFLOW2_VERSION:-v2.2.6}
     container_name: goflow2
     restart: unless-stopped
+    depends_on:
+      goflow-pipe-init:
+        condition: service_completed_successfully
     command:
       - -listen
       - netflow://:2055
       - -transport.file
-      - /var/log/goflow2/flows.log
+      - /run/goflow2/flows.pipe
     ports:
       - "${NETFLOW_PORT:-2055}:2055/udp"
     volumes:
-      - goflow-data:/var/log/goflow2
+      - goflow-pipe:/run/goflow2
     networks:
       - observability
 
   syslog-ng:
-    image: balabit/syslog-ng:latest
+    image: balabit/syslog-ng:${SYSLOG_NG_VERSION:-4.12.0}
     container_name: syslog-ng
     restart: unless-stopped
     depends_on:
-      - openobserve
-      - goflow2
+      openobserve:
+        condition: service_started
+      goflow-pipe-init:
+        condition: service_completed_successfully
     environment:
       TZ: ${TZ:-Europe/Warsaw}
       OPENOBSERVE_USER: ${OPENOBSERVE_USER}
@@ -47,12 +73,12 @@ services:
       - "${SYSLOG_PORT:-5514}:5514/udp"
     volumes:
       - ./config/syslog-ng/syslog-ng.conf:/etc/syslog-ng/syslog-ng.conf:ro
-      - goflow-data:/var/log/goflow2:ro
+      - goflow-pipe:/run/goflow2
     networks:
       - observability
 
 volumes:
-  goflow-data:
+  goflow-pipe:
 
 networks:
   observability:
