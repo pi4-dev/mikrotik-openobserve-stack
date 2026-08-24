@@ -1,0 +1,51 @@
+# OpenObserve / VRL function: mikrotik_dns_parser
+#
+# Input example:
+#   .message = "query from 10.254.249.10: #8630451 static.cloudflareinsights.com. A"
+#
+# Output fields:
+#   dns_client_ip
+#   dns_query_id
+#   dns_domain
+#   dns_record_type
+#   dns_tld
+#   dns_public_suffix
+#   dns_registered_domain
+
+parsed, err = parse_regex(
+    .message,
+    r'^query from (?P<dns_client_ip>.+?):\s+#(?P<dns_query_id>\d+)\s+(?P<dns_domain>\S+?)(?:\.)?\s+(?P<dns_record_type>[A-Za-z0-9]+)\s*$'
+)
+
+if err == null {
+    .dns_client_ip = string!(parsed.dns_client_ip)
+    .dns_domain = downcase!(parsed.dns_domain)
+    .dns_record_type = upcase!(parsed.dns_record_type)
+    .dns_query_id = string!(parsed.dns_query_id)
+
+    # Literal TLD: the last DNS label, e.g. "uk" for example.co.uk.
+    tld, tld_err = parse_regex(
+        .dns_domain,
+        r'\.(?P<tld>[^.]+)$'
+    )
+
+    if tld_err == null {
+        .dns_tld = downcase!(tld.tld)
+    }
+
+    # Public Suffix List-aware values.
+    # Examples:
+    #   static.cloudflareinsights.com -> public suffix com, registered domain cloudflareinsights.com
+    #   host.example.co.uk           -> public suffix co.uk, registered domain example.co.uk
+    etld, etld_err = parse_etld(
+        .dns_domain,
+        plus_parts: 1
+    )
+
+    if etld_err == null {
+        .dns_public_suffix = string!(etld.etld)
+        .dns_registered_domain = string!(etld.etld_plus)
+    }
+}
+
+.
